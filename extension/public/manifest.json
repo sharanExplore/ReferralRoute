@@ -1,0 +1,11 @@
+{
+  "manifest_version": 3,
+  "name": "ReferralRoute",
+  "version": "1.0.0",
+  "description": "Organize job opportunities and find referral contacts.",
+  "action": {
+    "default_popup": "index.html",
+    "default_title": "ReferralRoute"
+  },
+  "permissions": []
+}

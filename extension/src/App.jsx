@@ -137,14 +137,15 @@ export default function App() {
     scanActiveTab();
   }, [loadSavedJobs, scanActiveTab]);
 
-  // Check if current detected job is saved (matched by canonicalUrl or title+company)
+  // Check if current detected job is saved (prioritizing canonicalUrl; fallback to title+company only if canonicalUrl is absent)
   const isCurrentJobSaved = Boolean(
     detectedJob &&
-      savedJobs.some(
-        (j) =>
-          (j.canonicalUrl && j.canonicalUrl === detectedJob.canonicalUrl) ||
-          (j.title === detectedJob.title && j.company === detectedJob.company)
-      )
+      savedJobs.some((j) => {
+        if (detectedJob.canonicalUrl && j.canonicalUrl) {
+          return j.canonicalUrl === detectedJob.canonicalUrl;
+        }
+        return j.title === detectedJob.title && j.company === detectedJob.company;
+      })
   );
 
   // Save or remove job in chrome.storage.local
@@ -153,11 +154,12 @@ export default function App() {
 
     if (isCurrentJobSaved) {
       // Remove job
-      const updated = savedJobs.filter(
-        (j) =>
-          j.canonicalUrl !== detectedJob.canonicalUrl &&
-          !(j.title === detectedJob.title && j.company === detectedJob.company)
-      );
+      const updated = savedJobs.filter((j) => {
+        if (detectedJob.canonicalUrl && j.canonicalUrl) {
+          return j.canonicalUrl !== detectedJob.canonicalUrl;
+        }
+        return !(j.title === detectedJob.title && j.company === detectedJob.company);
+      });
       if (typeof chrome !== 'undefined' && chrome.storage?.local) {
         chrome.storage.local.set({ savedJobs: updated }, () => {
           setSavedJobs(updated);

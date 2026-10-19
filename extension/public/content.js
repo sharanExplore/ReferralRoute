@@ -2,6 +2,14 @@
 // Strictly handles LinkedIn DOM extraction without fabricating missing details.
 
 (function () {
+  // Prevent duplicate script execution and duplicate listeners if dynamically re-injected
+  if (typeof window !== 'undefined' && window.__REFERRAL_ROUTE_CONTENT_INJECTED__) {
+    return;
+  }
+  if (typeof window !== 'undefined') {
+    window.__REFERRAL_ROUTE_CONTENT_INJECTED__ = true;
+  }
+
   /**
    * Cleans raw text extracted from DOM nodes
    */
@@ -43,9 +51,9 @@
       // Fallback
     }
 
-    // Check active job card attribute in search DOM
+    // Check active job card attribute in search DOM (strictly requires active class)
     const activeItem = document.querySelector(
-      '.jobs-search-results-list__list-item--active[data-occludable-job-id], [data-job-id].active, [data-occludable-job-id]'
+      '.jobs-search-results-list__list-item--active[data-occludable-job-id], .jobs-search-results-list__list-item--active [data-job-id], [data-job-id].active, .jobs-search-results-list__list-item--active'
     );
     if (activeItem) {
       const attrId =

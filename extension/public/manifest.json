@@ -2,10 +2,28 @@
   "manifest_version": 3,
   "name": "ReferralRoute",
   "version": "1.0.0",
-  "description": "Organize job opportunities and find referral contacts.",
+  "description": "LinkedIn job tracker and referral route organizer.",
   "action": {
     "default_popup": "index.html",
     "default_title": "ReferralRoute"
   },
-  "permissions": []
+  "permissions": [
+    "activeTab",
+    "storage",
+    "scripting"
+  ],
+  "host_permissions": [
+    "*://*.linkedin.com/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "*://*.linkedin.com/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ]
 }

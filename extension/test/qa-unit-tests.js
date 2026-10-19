@@ -105,23 +105,79 @@ function isSavedCheck(detectedJob, savedJobs) {
   console.log('✓ Test 2.2: Exact canonical URL correctly detected as saved.');
 }
 
-// --- Test 3: B1 Idempotent Injection Guard ---
+// --- Test 3: Safe Re-injection Lifecycle ---
 {
+  const mockChrome = {
+    listeners: new Set(),
+    runtime: {
+      onMessage: {
+        addListener(fn) {
+          mockChrome.listeners.add(fn);
+        },
+        removeListener(fn) {
+          mockChrome.listeners.delete(fn);
+        },
+      },
+    },
+  };
+
   const mockWindow = {};
-  function simulateContentScriptInjection(win) {
-    if (win.__REFERRAL_ROUTE_CONTENT_INJECTED__) {
-      return 'ALREADY_INJECTED';
+
+  function injectScript(win, chromeApi) {
+    if (win.__REFERRAL_ROUTE_MESSAGE_LISTENER__) {
+      try {
+        chromeApi.runtime.onMessage.removeListener(win.__REFERRAL_ROUTE_MESSAGE_LISTENER__);
+      } catch (e) {}
     }
-    win.__REFERRAL_ROUTE_CONTENT_INJECTED__ = true;
-    return 'INJECTED_SUCCESSFULLY';
+
+    const handler = () => 'RESPONSE';
+    win.__REFERRAL_ROUTE_MESSAGE_LISTENER__ = handler;
+    chromeApi.runtime.onMessage.addListener(handler);
   }
 
-  const run1 = simulateContentScriptInjection(mockWindow);
-  assert.strictEqual(run1, 'INJECTED_SUCCESSFULLY', 'First injection should succeed');
+  // Initial injection
+  injectScript(mockWindow, mockChrome);
+  assert.strictEqual(mockChrome.listeners.size, 1, 'Should have 1 active listener after first injection');
 
-  const run2 = simulateContentScriptInjection(mockWindow);
-  assert.strictEqual(run2, 'ALREADY_INJECTED', 'Second injection must early return to avoid duplicate listeners');
-  console.log('✓ Test 3.1: B1 injection guard prevents duplicate listener attachment.');
+  // Re-injection (e.g. after extension reload or retry)
+  injectScript(mockWindow, mockChrome);
+  assert.strictEqual(mockChrome.listeners.size, 1, 'Must maintain exactly 1 active listener, replacing the old handler');
+  console.log('✓ Test 3.1: Re-injection lifecycle maintains working listener without duplicates.');
+}
+
+// --- Test 4: Detail-Pane Scoping Priority ---
+{
+  // Simulates a split-view page where the left search list has one job and the right panel has the selected job
+  const mockDOM = {
+    searchListJob: { title: 'First Unrelated Job', company: 'Company A' },
+    activeDetailPane: {
+      title: 'Full Stack Developer',
+      company: 'Jobgether',
+      location: 'India (Remote) · 1 week ago · 40 applicants',
+    },
+  };
+
+  function extractJobScoped(mockData) {
+    const pane = mockData.activeDetailPane;
+    // Location cleaner logic
+    const segments = pane.location.split(/[·•]/);
+    const cleanLoc = segments.find(
+      (s) => !/\b(ago|applicants?|reposted)\b/i.test(s)
+    ).trim();
+
+    return {
+      title: pane.title,
+      company: pane.company,
+      location: cleanLoc,
+    };
+  }
+
+  const extracted = extractJobScoped(mockDOM);
+  assert.strictEqual(extracted.title, 'Full Stack Developer', 'Must extract title from active detail pane');
+  assert.strictEqual(extracted.company, 'Jobgether', 'Must extract company from active detail pane');
+  assert.strictEqual(extracted.location, 'India (Remote)', 'Must clean bullet metadata from location');
+  console.log('✓ Test 4.1: Split-view details pane extraction extracts correct selected job.');
 }
 
 console.log('--- All ReferralRoute QA Unit Tests Passed Successfully ---');
+

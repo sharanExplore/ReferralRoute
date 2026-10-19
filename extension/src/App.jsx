@@ -35,32 +35,70 @@ export default function App() {
     setErrorMessage('');
     setDetectedJob(null);
 
+    const scanStartTime = Date.now();
+    const renderWithFeedbackDelay = (fn) => {
+      const elapsed = Date.now() - scanStartTime;
+      const minDelay = 250; // Ensure user visibly sees loading state during scans
+      if (elapsed < minDelay) {
+        setTimeout(fn, minDelay - elapsed);
+      } else {
+        fn();
+      }
+    };
+
     if (typeof chrome === 'undefined' || !chrome.tabs) {
       // Running outside Chrome Extension environment (e.g. standalone browser test)
-      setScanStatus('NOT_LINKEDIN');
-      setErrorMessage(
-        'Chrome extension API not detected. Please run this inside Chrome with the extension loaded.'
-      );
+      renderWithFeedbackDelay(() => {
+        setScanStatus('NOT_LINKEDIN');
+        setErrorMessage(
+          'Chrome extension API not detected. Please run this inside Chrome with the extension loaded.'
+        );
+      });
       return;
     }
 
     chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
       const currentTab = tabs && tabs[0];
       if (!currentTab || !currentTab.url) {
-        setScanStatus('ERROR');
-        setErrorMessage('Unable to inspect active browser tab.');
+        renderWithFeedbackDelay(() => {
+          setScanStatus('ERROR');
+          setErrorMessage('Unable to inspect active browser tab.');
+        });
         return;
       }
 
       const url = currentTab.url.toLowerCase();
       // Strictly enforce LinkedIn-only
       if (!url.includes('linkedin.com')) {
-        setScanStatus('NOT_LINKEDIN');
-        setErrorMessage(
-          'ReferralRoute exclusively supports LinkedIn. Please navigate to a LinkedIn job posting.'
-        );
+        renderWithFeedbackDelay(() => {
+          setScanStatus('NOT_LINKEDIN');
+          setErrorMessage(
+            'ReferralRoute exclusively supports LinkedIn. Please navigate to a LinkedIn job posting.'
+          );
+        });
         return;
       }
+
+      const processExtractionResponse = (response) => {
+        if (!response) {
+          setScanStatus('ERROR');
+          setErrorMessage(
+            'Unable to communicate with the LinkedIn page. Please reload the tab and retry.'
+          );
+          return;
+        }
+
+        if (response.success && response.data) {
+          setDetectedJob(response.data);
+          setScanStatus('SUCCESS');
+        } else {
+          setScanStatus('NO_JOB');
+          setErrorMessage(
+            response.message ||
+              'No job listing detected on this page. Please make sure a job listing is active or selected.'
+          );
+        }
+      };
 
       // Check if content script responds, otherwise inject dynamically
       const handleScanResponse = (response) => {
@@ -74,10 +112,12 @@ export default function App() {
               },
               () => {
                 if (chrome.runtime.lastError) {
-                  setScanStatus('ERROR');
-                  setErrorMessage(
-                    'Could not connect to LinkedIn page. Please refresh the LinkedIn tab and retry.'
-                  );
+                  renderWithFeedbackDelay(() => {
+                    setScanStatus('ERROR');
+                    setErrorMessage(
+                      'Could not connect to the LinkedIn page. Please reload the LinkedIn tab (F5) and retry.'
+                    );
+                  });
                   return;
                 }
                 // Retry sending message after script injection
@@ -85,7 +125,18 @@ export default function App() {
                   currentTab.id,
                   { type: 'SCAN_LINKEDIN_JOB' },
                   (retryRes) => {
-                    processExtractionResponse(retryRes);
+                    if (chrome.runtime.lastError) {
+                      renderWithFeedbackDelay(() => {
+                        setScanStatus('ERROR');
+                        setErrorMessage(
+                          'Could not establish connection to the LinkedIn page. Please refresh the tab.'
+                        );
+                      });
+                      return;
+                    }
+                    renderWithFeedbackDelay(() => {
+                      processExtractionResponse(retryRes);
+                    });
                   }
                 );
               }
@@ -93,35 +144,18 @@ export default function App() {
             return;
           }
 
-          setScanStatus('ERROR');
-          setErrorMessage(
-            'Unable to communicate with the page. Please refresh your LinkedIn tab.'
-          );
+          renderWithFeedbackDelay(() => {
+            setScanStatus('ERROR');
+            setErrorMessage(
+              'Unable to communicate with the page. Please refresh your LinkedIn tab.'
+            );
+          });
           return;
         }
 
-        processExtractionResponse(response);
-      };
-
-      const processExtractionResponse = (response) => {
-        if (!response) {
-          setScanStatus('NO_JOB');
-          setErrorMessage(
-            'No response from LinkedIn page. Ensure you are on a job post and click Retry.'
-          );
-          return;
-        }
-
-        if (response.success && response.data) {
-          setDetectedJob(response.data);
-          setScanStatus('SUCCESS');
-        } else {
-          setScanStatus('NO_JOB');
-          setErrorMessage(
-            response.message ||
-              'No job listing detected on this page. Please navigate to a specific job post.'
-          );
-        }
+        renderWithFeedbackDelay(() => {
+          processExtractionResponse(response);
+        });
       };
 
       chrome.tabs.sendMessage(

@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="512" height="512" viewBox="0 0 512 512" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#2563eb" />
+      <stop offset="100%" stop-color="#1d4ed8" />
+    </linearGradient>
+    <filter id="subtleGlow" x="-10%" y="-10%" width="120%" height="120%">
+      <feDropShadow dx="0" dy="8" stdDeviation="12" flood-color="#0f172a" flood-opacity="0.35"/>
+    </filter>
+  </defs>
+  <!-- Rounded Container -->
+  <rect x="24" y="24" width="464" height="464" rx="104" fill="url(#bgGrad)" />
+  <!-- Referral Route Network Symbol -->
+  <g filter="url(#subtleGlow)">
+    <!-- Route Connector Path -->
+    <path d="M 196 138 H 314 A 60 60 0 0 1 374 198 V 316" fill="none" stroke="#ffffff" stroke-width="48" stroke-linecap="round" stroke-linejoin="round" />
+    <!-- Node 1 (Candidate) -->
+    <circle cx="138" cy="138" r="58" fill="none" stroke="#ffffff" stroke-width="48" />
+    <circle cx="138" cy="138" r="22" fill="#ffffff" />
+    <!-- Node 2 (Target Company / Contact) -->
+    <circle cx="374" cy="374" r="58" fill="none" stroke="#ffffff" stroke-width="48" />
+    <circle cx="374" cy="374" r="22" fill="#ffffff" />
+  </g>
+</svg>

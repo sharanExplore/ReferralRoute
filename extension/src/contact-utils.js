@@ -126,3 +126,68 @@ export function createContactRecord({
     updatedAt: now,
   };
 }
+
+/**
+ * Updates an existing contact record, validating status and updating the updatedAt timestamp.
+ */
+export function updateContactRecord(contact, updates = {}) {
+  const now = new Date().toISOString();
+  const nextStatus = updates.status && REFERRAL_STATUSES.includes(updates.status)
+    ? updates.status
+    : contact.status;
+
+  return {
+    ...contact,
+    ...updates,
+    status: nextStatus,
+    name: updates.name !== undefined ? updates.name.trim() : contact.name,
+    role: updates.role !== undefined ? updates.role.trim() : contact.role,
+    profileUrl: updates.profileUrl !== undefined ? updates.profileUrl.trim() : contact.profileUrl,
+    notes: updates.notes !== undefined ? updates.notes.trim() : contact.notes,
+    updatedAt: now,
+  };
+}
+
+/**
+ * Filters contacts associated with a specific saved job.
+ */
+export function filterContactsByJob(contacts = [], jobId) {
+  if (!jobId) return [];
+  return contacts.filter((c) => c.jobId === jobId);
+}
+
+/**
+ * Removes a specific contact by its ID.
+ */
+export function removeContactById(contacts = [], contactId) {
+  return contacts.filter((c) => c.id !== contactId);
+}
+
+/**
+ * Removes all contacts associated with a given job (for cascading deletion).
+ */
+export function removeContactsForJob(contacts = [], jobId) {
+  return contacts.filter((c) => c.jobId !== jobId);
+}
+
+/**
+ * Calculates count of contacts for each referral status.
+ */
+export function calculateStatusMetrics(contacts = []) {
+  const metrics = {
+    total: contacts.length,
+    'Not contacted': 0,
+    'Messaged': 0,
+    'Replied': 0,
+    'Referral received': 0,
+  };
+
+  for (const c of contacts) {
+    if (metrics[c.status] !== undefined) {
+      metrics[c.status]++;
+    }
+  }
+
+  return metrics;
+}
+

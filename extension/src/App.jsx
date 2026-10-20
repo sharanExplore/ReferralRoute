@@ -1,4 +1,44 @@
 import React, { useState, useEffect, useCallback } from 'react';
+import {
+  REFERRAL_STATUSES,
+  validateContactInput,
+  createContactRecord,
+  updateContactRecord,
+  filterContactsByJob,
+  removeContactById,
+  removeContactsForJob,
+  calculateStatusMetrics,
+} from './contact-utils.js';
+
+export function getStatusBadgeStyle(status) {
+  switch (status) {
+    case 'Messaged':
+      return {
+        backgroundColor: 'rgba(37, 99, 235, 0.2)',
+        color: '#93c5fd',
+        borderColor: 'rgba(59, 130, 246, 0.5)',
+      };
+    case 'Replied':
+      return {
+        backgroundColor: 'rgba(168, 85, 247, 0.2)',
+        color: '#c084fc',
+        borderColor: 'rgba(168, 85, 247, 0.5)',
+      };
+    case 'Referral received':
+      return {
+        backgroundColor: 'rgba(16, 185, 129, 0.2)',
+        color: '#34d399',
+        borderColor: 'rgba(16, 185, 129, 0.5)',
+      };
+    case 'Not contacted':
+    default:
+      return {
+        backgroundColor: '#1e293b',
+        color: '#94a3b8',
+        borderColor: '#334155',
+      };
+  }
+}
 
 export default function App() {
   const [activeTab, setActiveTab] = useState('capture');
@@ -6,6 +46,18 @@ export default function App() {
   const [detectedJob, setDetectedJob] = useState(null);
   const [errorMessage, setErrorMessage] = useState('');
   const [savedJobs, setSavedJobs] = useState([]);
+  const [contacts, setContacts] = useState([]);
+  const [selectedJobId, setSelectedJobId] = useState(null);
+  const [isAddingContact, setIsAddingContact] = useState(false);
+  const [editingContactId, setEditingContactId] = useState(null);
+  const [contactFormData, setContactFormData] = useState({
+    name: '',
+    role: '',
+    profileUrl: '',
+    status: 'Not contacted',
+    notes: '',
+  });
+  const [contactFormError, setContactFormError] = useState('');
   const [toastMessage, setToastMessage] = useState('');
   const [showFullDescription, setShowFullDescription] = useState(false);
   const [showArchInfo, setShowArchInfo] = useState(false);
@@ -16,14 +68,21 @@ export default function App() {
     setTimeout(() => setToastMessage(''), 2600);
   };
 
-  // Load saved jobs from chrome.storage.local
-  const loadSavedJobs = useCallback(() => {
+  // Load saved jobs and referral contacts from chrome.storage.local
+  const loadSavedData = useCallback(() => {
     if (typeof chrome !== 'undefined' && chrome.storage && chrome.storage.local) {
-      chrome.storage.local.get(['savedJobs'], (result) => {
+      chrome.storage.local.get(['savedJobs', 'referralContacts', 'contacts'], (result) => {
         if (result && Array.isArray(result.savedJobs)) {
           setSavedJobs(result.savedJobs);
         } else {
           setSavedJobs([]);
+        }
+
+        const loadedContacts = result?.referralContacts || result?.contacts;
+        if (Array.isArray(loadedContacts)) {
+          setContacts(loadedContacts);
+        } else {
+          setContacts([]);
         }
       });
     }
@@ -167,9 +226,9 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    loadSavedJobs();
+    loadSavedData();
     scanActiveTab();
-  }, [loadSavedJobs, scanActiveTab]);
+  }, [loadSavedData, scanActiveTab]);
 
   // Check if current detected job is saved (prioritizing canonicalUrl; fallback to title+company only if canonicalUrl is absent)
   const isCurrentJobSaved = Boolean(
@@ -182,25 +241,58 @@ export default function App() {
       })
   );
 
-  // Save or remove job in chrome.storage.local
+  // Helper to persist contacts in state and chrome.storage.local
+  const persistContacts = (updatedContacts) => {
+    setContacts(updatedContacts);
+    if (typeof chrome !== 'undefined' && chrome.storage?.local) {
+      chrome.storage.local.set({ referralContacts: updatedContacts });
+    }
+  };
+
+  // Save or remove job in chrome.storage.local (with cascading contact cleanup)
   const handleToggleSaveJob = () => {
     if (!detectedJob) return;
 
     if (isCurrentJobSaved) {
+      // Find job being removed
+      const jobToRemove = savedJobs.find((j) => {
+        if (detectedJob.canonicalUrl && j.canonicalUrl) {
+          return j.canonicalUrl === detectedJob.canonicalUrl;
+        }
+        return j.title === detectedJob.title && j.company === detectedJob.company;
+      });
+
       // Remove job
-      const updated = savedJobs.filter((j) => {
+      const updatedJobs = savedJobs.filter((j) => {
         if (detectedJob.canonicalUrl && j.canonicalUrl) {
           return j.canonicalUrl !== detectedJob.canonicalUrl;
         }
         return !(j.title === detectedJob.title && j.company === detectedJob.company);
       });
+
+      // Cascade remove contacts associated with this job
+      const updatedContacts = jobToRemove
+        ? removeContactsForJob(contacts, jobToRemove.id)
+        : contacts;
+
       if (typeof chrome !== 'undefined' && chrome.storage?.local) {
-        chrome.storage.local.set({ savedJobs: updated }, () => {
-          setSavedJobs(updated);
-          triggerToast('Job removed from saved pipeline.');
-        });
+        chrome.storage.local.set(
+          { savedJobs: updatedJobs, referralContacts: updatedContacts },
+          () => {
+            setSavedJobs(updatedJobs);
+            setContacts(updatedContacts);
+            if (jobToRemove && selectedJobId === jobToRemove.id) {
+              setSelectedJobId(null);
+            }
+            triggerToast('Job removed from saved pipeline.');
+          }
+        );
       } else {
-        setSavedJobs(updated);
+        setSavedJobs(updatedJobs);
+        setContacts(updatedContacts);
+        if (jobToRemove && selectedJobId === jobToRemove.id) {
+          setSelectedJobId(null);
+        }
       }
     } else {
       // Prevent duplicates
@@ -229,17 +321,137 @@ export default function App() {
     }
   };
 
-  // Remove specific job from pipeline tab
+  // Remove specific job from pipeline tab (with cascading contact cleanup)
   const handleRemoveFromPipeline = (jobToRemove) => {
-    const updated = savedJobs.filter((j) => j.id !== jobToRemove.id);
+    const updatedJobs = savedJobs.filter((j) => j.id !== jobToRemove.id);
+    const updatedContacts = removeContactsForJob(contacts, jobToRemove.id);
+
     if (typeof chrome !== 'undefined' && chrome.storage?.local) {
-      chrome.storage.local.set({ savedJobs: updated }, () => {
-        setSavedJobs(updated);
-        triggerToast('Removed from pipeline.');
-      });
+      chrome.storage.local.set(
+        { savedJobs: updatedJobs, referralContacts: updatedContacts },
+        () => {
+          setSavedJobs(updatedJobs);
+          setContacts(updatedContacts);
+          if (selectedJobId === jobToRemove.id) {
+            setSelectedJobId(null);
+          }
+          triggerToast('Removed job and associated contacts from pipeline.');
+        }
+      );
     } else {
-      setSavedJobs(updated);
+      setSavedJobs(updatedJobs);
+      setContacts(updatedContacts);
+      if (selectedJobId === jobToRemove.id) {
+        setSelectedJobId(null);
+      }
+      triggerToast('Removed job and associated contacts from pipeline.');
     }
+  };
+
+  // Contact CRUD Handlers
+  const handleStartAddContact = () => {
+    setEditingContactId(null);
+    setContactFormData({
+      name: '',
+      role: '',
+      profileUrl: '',
+      status: 'Not contacted',
+      notes: '',
+    });
+    setContactFormError('');
+    setIsAddingContact(true);
+  };
+
+  const handleStartEditContact = (contact) => {
+    setIsAddingContact(false);
+    setEditingContactId(contact.id);
+    setContactFormData({
+      name: contact.name || '',
+      role: contact.role || '',
+      profileUrl: contact.profileUrl || '',
+      status: contact.status || 'Not contacted',
+      notes: contact.notes || '',
+    });
+    setContactFormError('');
+  };
+
+  const handleCancelContactForm = () => {
+    setIsAddingContact(false);
+    setEditingContactId(null);
+    setContactFormData({
+      name: '',
+      role: '',
+      profileUrl: '',
+      status: 'Not contacted',
+      notes: '',
+    });
+    setContactFormError('');
+  };
+
+  const handleSaveContact = (jobId) => {
+    const validation = validateContactInput({
+      name: contactFormData.name,
+      profileUrl: contactFormData.profileUrl,
+      jobId,
+      existingContacts: contacts,
+      currentContactId: editingContactId,
+    });
+
+    if (!validation.valid) {
+      setContactFormError(validation.error);
+      return;
+    }
+
+    if (editingContactId) {
+      const existing = contacts.find((c) => c.id === editingContactId);
+      if (!existing) return;
+
+      const updated = updateContactRecord(existing, {
+        name: validation.data.cleanName,
+        role: contactFormData.role,
+        profileUrl: validation.data.cleanUrl,
+        status: contactFormData.status,
+        notes: contactFormData.notes,
+      });
+
+      const updatedList = contacts.map((c) => (c.id === editingContactId ? updated : c));
+      persistContacts(updatedList);
+      triggerToast('Contact updated successfully!');
+    } else {
+      const newContact = createContactRecord({
+        jobId,
+        name: validation.data.cleanName,
+        role: contactFormData.role,
+        profileUrl: validation.data.cleanUrl,
+        status: contactFormData.status,
+        notes: contactFormData.notes,
+      });
+
+      const updatedList = [newContact, ...contacts];
+      persistContacts(updatedList);
+      triggerToast('Referral contact added!');
+    }
+
+    handleCancelContactForm();
+  };
+
+  const handleDeleteContact = (contactId) => {
+    const updated = removeContactById(contacts, contactId);
+    persistContacts(updated);
+    if (editingContactId === contactId) {
+      handleCancelContactForm();
+    }
+    triggerToast('Contact deleted.');
+  };
+
+  const handleQuickStatusChange = (contactId, newStatus) => {
+    const existing = contacts.find((c) => c.id === contactId);
+    if (!existing) return;
+
+    const updated = updateContactRecord(existing, { status: newStatus });
+    const updatedList = contacts.map((c) => (c.id === contactId ? updated : c));
+    persistContacts(updatedList);
+    triggerToast(`Status updated: "${newStatus}"`);
   };
 
   // Launch LinkedIn People Search for 1st & 2nd degree connections at the company
@@ -676,93 +888,527 @@ export default function App() {
         {/* Tab 2: Saved Pipeline (Backed by chrome.storage.local) */}
         {activeTab === 'pipeline' && (
           <div style={styles.tabContent}>
-            <div style={styles.tabHeadingBlock}>
-              <div style={styles.tabTitleRow}>
-                <h2 style={styles.tabHeading}>Saved Jobs Pipeline</h2>
-                <span style={styles.pipelineCountBadge}>
-                  {savedJobs.length} {savedJobs.length === 1 ? 'Job' : 'Jobs'}
-                </span>
-              </div>
-              <p style={styles.tabDesc}>
-                Persisted in local extension storage. Filtered and managed locally.
-              </p>
-            </div>
+            {selectedJobId && savedJobs.some((j) => j.id === selectedJobId) ? (
+              (() => {
+                const selectedJob = savedJobs.find((j) => j.id === selectedJobId);
+                const jobContacts = filterContactsByJob(contacts, selectedJob.id);
 
-            {savedJobs.length === 0 ? (
-              <div style={styles.emptyPipelineCard}>
-                <span style={styles.emptyIcon}>📂</span>
-                <h4 style={styles.emptyTitle}>No Jobs Saved Yet</h4>
-                <p style={styles.emptyDesc}>
-                  Open a LinkedIn job posting and click &quot;Save Job to Route&quot; on the Capture tab to track it here.
-                </p>
-              </div>
-            ) : (
-              <div style={styles.pipelineList}>
-                {savedJobs.map((job) => (
-                  <div key={job.id} style={styles.pipelineItem}>
-                    <div style={styles.pipelineItemHeader}>
-                      <div>
-                        <h4 style={styles.pipelineJobTitle}>{job.title}</h4>
-                        <span style={styles.pipelineCompany}>{job.company}</span>
-                      </div>
-                      <span style={styles.pipelineStatusBadge}>{job.status || 'Saved'}</span>
-                    </div>
-
-                    <div style={styles.pipelineMetaRow}>
-                      {job.location && (
-                        <span style={styles.pipelineMetaPill}>📍 {job.location}</span>
-                      )}
-                      {job.workplaceType && (
-                        <span style={styles.pipelineMetaPill}>🏢 {job.workplaceType}</span>
-                      )}
-                      {job.salary && (
-                        <span style={styles.pipelineMetaPillSalary}>💰 {job.salary}</span>
-                      )}
-                    </div>
-
-                    <div style={styles.pipelineActions}>
+                return (
+                  <>
+                    {/* Back navigation & Hub badge */}
+                    <div style={styles.detailNavRow}>
                       <button
-                        onClick={() => handleSearchCompanyConnections(job.company)}
-                        style={styles.pipelineReferralBtn}
-                        title="Search referral contacts for this company"
+                        onClick={() => {
+                          setSelectedJobId(null);
+                          handleCancelContactForm();
+                        }}
+                        style={styles.backButton}
                       >
-                        Find Referrals
-                      </button>
-
-                      {job.canonicalUrl && (
-                        <button
-                          onClick={() => handleOpenJobUrl(job.canonicalUrl)}
-                          style={styles.pipelineLinkBtn}
-                          title="Open canonical LinkedIn job page"
+                        <svg
+                          width="14"
+                          height="14"
+                          viewBox="0 0 24 24"
+                          fill="none"
+                          stroke="currentColor"
+                          strokeWidth="2.4"
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
                         >
-                          View Job ↗
+                          <line x1="19" y1="12" x2="5" y2="12" />
+                          <polyline points="12 19 5 12 12 5" />
+                        </svg>
+                        <span>Back to Pipeline</span>
+                      </button>
+                      <span style={styles.detailScopeBadge}>Job Referral Hub</span>
+                    </div>
+
+                    {/* Opened Job Summary Card */}
+                    <div style={styles.detailJobCard}>
+                      <div style={styles.detailJobHeaderRow}>
+                        <div style={styles.companyAvatarSmall}>
+                          {selectedJob.company
+                            ? selectedJob.company.charAt(0).toUpperCase()
+                            : '💼'}
+                        </div>
+                        <div style={{ flex: 1, minWidth: 0 }}>
+                          <h3 style={styles.detailJobTitle}>{selectedJob.title}</h3>
+                          <span style={styles.detailJobCompany}>{selectedJob.company}</span>
+                        </div>
+                        <span style={styles.pipelineStatusBadge}>
+                          {selectedJob.status || 'Saved'}
+                        </span>
+                      </div>
+
+                      <div style={styles.pipelineMetaRow}>
+                        {selectedJob.location && (
+                          <span style={styles.pipelineMetaPill}>📍 {selectedJob.location}</span>
+                        )}
+                        {selectedJob.workplaceType && (
+                          <span style={styles.pipelineMetaPill}>🏢 {selectedJob.workplaceType}</span>
+                        )}
+                        {selectedJob.salary && (
+                          <span style={styles.pipelineMetaPillSalary}>💰 {selectedJob.salary}</span>
+                        )}
+                      </div>
+
+                      <div style={styles.detailActionsRow}>
+                        <button
+                          onClick={() => handleSearchCompanyConnections(selectedJob.company)}
+                          style={styles.findReferralsMainBtn}
+                          title="Open LinkedIn search for connections at this company"
+                        >
+                          <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
+                            <path d="M19 3a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h14m-.5 15.5v-5.3a3.26 3.26 0 0 0-3.26-3.26c-.85 0-1.84.52-2.28 1.3v-1.11h-2.79v8.37h2.79v-4.93c0-.77.62-1.4 1.39-1.4a1.4 1.4 0 0 1 1.4 1.4v4.93h2.75M6.88 8.56a1.68 1.68 0 0 0 1.68-1.68c0-.93-.75-1.69-1.68-1.69a1.69 1.69 0 0 0-1.69 1.69c0 .93.76 1.68 1.69 1.68m1.39 9.94v-8.37H5.5v8.37h2.77z" />
+                          </svg>
+                          Find Referrals
                         </button>
+
+                        {selectedJob.canonicalUrl && (
+                          <button
+                            onClick={() => handleOpenJobUrl(selectedJob.canonicalUrl)}
+                            style={styles.detailViewJobBtn}
+                            title="Open canonical LinkedIn job page"
+                          >
+                            View Job ↗
+                          </button>
+                        )}
+                      </div>
+                    </div>
+
+                    {/* Referral Contacts Section */}
+                    <div style={styles.contactsSection}>
+                      <div style={styles.contactsSectionHeader}>
+                        <div style={styles.contactsTitleGroup}>
+                          <h4 style={styles.contactsSectionTitle}>Referral Contacts</h4>
+                          <span style={styles.contactsCountBadge}>
+                            {jobContacts.length}
+                          </span>
+                        </div>
+                        {!isAddingContact && !editingContactId && (
+                          <button
+                            onClick={handleStartAddContact}
+                            style={styles.addContactButton}
+                          >
+                            + Add Contact
+                          </button>
+                        )}
+                      </div>
+
+                      {/* Add / Edit Contact Form */}
+                      {(isAddingContact || editingContactId) && (
+                        <div style={styles.contactFormCard}>
+                          <div style={styles.contactFormHeader}>
+                            <span style={styles.contactFormTitle}>
+                              {editingContactId ? 'Edit Referral Contact' : 'Track New Referral Contact'}
+                            </span>
+                            <button
+                              onClick={handleCancelContactForm}
+                              style={styles.formCloseBtn}
+                              title="Cancel"
+                            >
+                              ✕
+                            </button>
+                          </div>
+
+                          {contactFormError && (
+                            <div style={styles.formErrorBanner}>
+                              <span>⚠️</span>
+                              <span>{contactFormError}</span>
+                            </div>
+                          )}
+
+                          <div style={styles.formFields}>
+                            <div style={styles.formField}>
+                              <label style={styles.formLabel}>
+                                Contact Name <span style={styles.requiredStar}>*</span>
+                              </label>
+                              <input
+                                type="text"
+                                placeholder="e.g. Alex Morgan"
+                                value={contactFormData.name}
+                                onChange={(e) =>
+                                  setContactFormData((prev) => ({ ...prev, name: e.target.value }))
+                                }
+                                style={styles.formInput}
+                              />
+                            </div>
+
+                            <div style={styles.formField}>
+                              <label style={styles.formLabel}>Role / Job Title</label>
+                              <input
+                                type="text"
+                                placeholder="e.g. Engineering Manager, Senior Designer"
+                                value={contactFormData.role}
+                                onChange={(e) =>
+                                  setContactFormData((prev) => ({ ...prev, role: e.target.value }))
+                                }
+                                style={styles.formInput}
+                              />
+                            </div>
+
+                            <div style={styles.formField}>
+                              <label style={styles.formLabel}>LinkedIn Profile URL</label>
+                              <input
+                                type="text"
+                                placeholder="e.g. linkedin.com/in/alexmorgan"
+                                value={contactFormData.profileUrl}
+                                onChange={(e) =>
+                                  setContactFormData((prev) => ({
+                                    ...prev,
+                                    profileUrl: e.target.value,
+                                  }))
+                                }
+                                style={styles.formInput}
+                              />
+                            </div>
+
+                            <div style={styles.formField}>
+                              <label style={styles.formLabel}>Outreach Status</label>
+                              <select
+                                value={contactFormData.status}
+                                onChange={(e) =>
+                                  setContactFormData((prev) => ({
+                                    ...prev,
+                                    status: e.target.value,
+                                  }))
+                                }
+                                style={styles.formSelect}
+                              >
+                                {REFERRAL_STATUSES.map((status) => (
+                                  <option key={status} value={status}>
+                                    {status}
+                                  </option>
+                                ))}
+                              </select>
+                            </div>
+
+                            <div style={styles.formField}>
+                              <label style={styles.formLabel}>Notes</label>
+                              <textarea
+                                placeholder="Outreach notes, mutual connections, conversation notes..."
+                                value={contactFormData.notes}
+                                onChange={(e) =>
+                                  setContactFormData((prev) => ({
+                                    ...prev,
+                                    notes: e.target.value,
+                                  }))
+                                }
+                                style={styles.formTextarea}
+                              />
+                            </div>
+
+                            <div style={styles.formBtnRow}>
+                              <button
+                                onClick={() => handleSaveContact(selectedJob.id)}
+                                style={styles.formSubmitBtn}
+                              >
+                                {editingContactId ? 'Update Contact' : 'Save Contact'}
+                              </button>
+                              <button
+                                onClick={handleCancelContactForm}
+                                style={styles.formCancelBtn}
+                              >
+                                Cancel
+                              </button>
+                            </div>
+                          </div>
+                        </div>
                       )}
 
-                      <button
-                        onClick={() => handleRemoveFromPipeline(job)}
-                        style={styles.pipelineDeleteBtn}
-                        title="Remove from pipeline"
-                      >
-                        ✕
-                      </button>
+                      {/* Contacts List */}
+                      {jobContacts.length === 0 &&
+                      !isAddingContact &&
+                      !editingContactId ? (
+                        <div style={styles.emptyContactsCard}>
+                          <span style={{ fontSize: '24px' }}>👥</span>
+                          <h5 style={styles.emptyContactsTitle}>No referral contacts tracked yet</h5>
+                          <p style={styles.emptyContactsDesc}>
+                            Search for connections at {selectedJob.company} on LinkedIn and track them here to manage your outreach.
+                          </p>
+                          <button
+                            onClick={handleStartAddContact}
+                            style={styles.emptyAddContactBtn}
+                          >
+                            + Add First Contact
+                          </button>
+                        </div>
+                      ) : (
+                        <div style={styles.contactsList}>
+                          {jobContacts.map((contact) => (
+                            <div key={contact.id} style={styles.contactItemCard}>
+                              <div style={styles.contactCardHeaderRow}>
+                                <div style={styles.contactCardIdentity}>
+                                  <div style={styles.contactAvatar}>
+                                    {contact.name ? contact.name.charAt(0).toUpperCase() : '👤'}
+                                  </div>
+                                  <div style={{ minWidth: 0 }}>
+                                    <h5 style={styles.contactCardName}>{contact.name}</h5>
+                                    {contact.role ? (
+                                      <span style={styles.contactCardRole}>{contact.role}</span>
+                                    ) : (
+                                      <span style={styles.contactCardRoleMuted}>
+                                        Role not specified
+                                      </span>
+                                    )}
+                                  </div>
+                                </div>
+
+                                {/* Status Selector Dropdown */}
+                                <select
+                                  value={contact.status}
+                                  onChange={(e) =>
+                                    handleQuickStatusChange(contact.id, e.target.value)
+                                  }
+                                  style={{
+                                    ...styles.statusDropdown,
+                                    ...getStatusBadgeStyle(contact.status),
+                                  }}
+                                  title="Change outreach status"
+                                >
+                                  {REFERRAL_STATUSES.map((status) => (
+                                    <option key={status} value={status}>
+                                      {status}
+                                    </option>
+                                  ))}
+                                </select>
+                              </div>
+
+                              {/* Profile Link */}
+                              {contact.profileUrl && (
+                                <div style={styles.contactUrlRow}>
+                                  <svg
+                                    width="12"
+                                    height="12"
+                                    viewBox="0 0 24 24"
+                                    fill="currentColor"
+                                    style={{ flexShrink: 0, color: '#0a66c2' }}
+                                  >
+                                    <path d="M19 3a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h14m-.5 15.5v-5.3a3.26 3.26 0 0 0-3.26-3.26c-.85 0-1.84.52-2.28 1.3v-1.11h-2.79v8.37h2.79v-4.93c0-.77.62-1.4 1.39-1.4a1.4 1.4 0 0 1 1.4 1.4v4.93h2.75M6.88 8.56a1.68 1.68 0 0 0 1.68-1.68c0-.93-.75-1.69-1.68-1.69a1.69 1.69 0 0 0-1.69 1.69c0 .93.76 1.68 1.69 1.68m1.39 9.94v-8.37H5.5v8.37h2.77z" />
+                                  </svg>
+                                  <a
+                                    href="#profile"
+                                    onClick={(e) => {
+                                      e.preventDefault();
+                                      handleOpenJobUrl(contact.profileUrl);
+                                    }}
+                                    style={styles.contactUrlLink}
+                                    title={contact.profileUrl}
+                                  >
+                                    {contact.profileUrl.replace(/^https?:\/\/(www\.)?linkedin\.com\//i, '')}
+                                  </a>
+                                </div>
+                              )}
+
+                              {/* Notes */}
+                              {contact.notes && (
+                                <div style={styles.contactNotesBox}>
+                                  <span style={styles.notesLabel}>Notes:</span> {contact.notes}
+                                </div>
+                              )}
+
+                              {/* Card Actions */}
+                              <div style={styles.contactCardActions}>
+                                <button
+                                  onClick={() => handleStartEditContact(contact)}
+                                  style={styles.contactEditBtn}
+                                  title="Edit contact"
+                                >
+                                  Edit
+                                </button>
+                                <button
+                                  onClick={() => handleDeleteContact(contact.id)}
+                                  style={styles.contactDeleteBtn}
+                                  title="Delete contact"
+                                >
+                                  Delete
+                                </button>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      )}
                     </div>
+                  </>
+                );
+              })()
+            ) : (
+              <>
+                <div style={styles.tabHeadingBlock}>
+                  <div style={styles.tabTitleRow}>
+                    <h2 style={styles.tabHeading}>Saved Jobs Pipeline</h2>
+                    <span style={styles.pipelineCountBadge}>
+                      {savedJobs.length} {savedJobs.length === 1 ? 'Job' : 'Jobs'}
+                    </span>
                   </div>
-                ))}
-              </div>
+                  <p style={styles.tabDesc}>
+                    Click any job to open and manage its tracked referral contacts.
+                  </p>
+                </div>
+
+                {savedJobs.length === 0 ? (
+                  <div style={styles.emptyPipelineCard}>
+                    <span style={styles.emptyIcon}>📂</span>
+                    <h4 style={styles.emptyTitle}>No Jobs Saved Yet</h4>
+                    <p style={styles.emptyDesc}>
+                      Open a LinkedIn job posting and click &quot;Save Job to Route&quot; on the Capture tab to track it here.
+                    </p>
+                  </div>
+                ) : (
+                  <div style={styles.pipelineList}>
+                    {savedJobs.map((job) => {
+                      const jobContacts = filterContactsByJob(contacts, job.id);
+                      return (
+                        <div key={job.id} style={styles.pipelineItem}>
+                          <div
+                            style={styles.pipelineItemClickableHeader}
+                            onClick={() => setSelectedJobId(job.id)}
+                            title="Click to view details and manage referral contacts"
+                          >
+                            <div style={{ flex: 1, minWidth: 0 }}>
+                              <h4 style={styles.pipelineJobTitle}>{job.title}</h4>
+                              <span style={styles.pipelineCompany}>{job.company}</span>
+                            </div>
+                            <span style={styles.pipelineStatusBadge}>
+                              {job.status || 'Saved'}
+                            </span>
+                          </div>
+
+                          <div style={styles.pipelineMetaRow}>
+                            {job.location && (
+                              <span style={styles.pipelineMetaPill}>📍 {job.location}</span>
+                            )}
+                            {job.workplaceType && (
+                              <span style={styles.pipelineMetaPill}>🏢 {job.workplaceType}</span>
+                            )}
+                            {job.salary && (
+                              <span style={styles.pipelineMetaPillSalary}>💰 {job.salary}</span>
+                            )}
+                            <span style={styles.pipelineContactsPill}>
+                              👤 {jobContacts.length} {jobContacts.length === 1 ? 'Contact' : 'Contacts'}
+                            </span>
+                          </div>
+
+                          <div style={styles.pipelineActions}>
+                            <button
+                              onClick={() => setSelectedJobId(job.id)}
+                              style={styles.pipelineManageContactsBtn}
+                              title="Open job and manage referral contacts"
+                            >
+                              Manage Contacts ({jobContacts.length})
+                            </button>
+
+                            <button
+                              onClick={() => handleSearchCompanyConnections(job.company)}
+                              style={styles.pipelineReferralBtn}
+                              title="Search referral contacts for this company on LinkedIn"
+                            >
+                              Find Referrals
+                            </button>
+
+                            {job.canonicalUrl && (
+                              <button
+                                onClick={() => handleOpenJobUrl(job.canonicalUrl)}
+                                style={styles.pipelineLinkBtn}
+                                title="Open canonical LinkedIn job page"
+                              >
+                                View ↗
+                              </button>
+                            )}
+
+                            <button
+                              onClick={() => handleRemoveFromPipeline(job)}
+                              style={styles.pipelineDeleteBtn}
+                              title="Remove from pipeline"
+                            >
+                              ✕
+                            </button>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </>
             )}
           </div>
         )}
 
-        {/* Tab 3: Referrals Overview */}
+        {/* Tab 3: Referrals Overview & Outreach Metrics */}
         {activeTab === 'referrals' && (
           <div style={styles.tabContent}>
             <div style={styles.tabHeadingBlock}>
               <h2 style={styles.tabHeading}>Referral Engine</h2>
               <p style={styles.tabDesc}>
-                Strategic workflows for landing internal employee referrals.
+                Strategic workflows and outreach tracking across saved opportunities.
               </p>
             </div>
+
+            {/* Outreach Pipeline Metrics Grid */}
+            {(() => {
+              const metrics = calculateStatusMetrics(contacts);
+              return (
+                <div style={styles.metricsContainer}>
+                  <div style={styles.metricsHeader}>
+                    <span style={styles.metricsTitle}>Outreach Pipeline Status</span>
+                    <span style={styles.totalContactsBadge}>
+                      {metrics.total} Total {metrics.total === 1 ? 'Contact' : 'Contacts'}
+                    </span>
+                  </div>
+                  <div style={styles.metricsGrid}>
+                    <div style={styles.metricCardNotContacted}>
+                      <span style={styles.metricNumber}>{metrics['Not contacted']}</span>
+                      <span style={styles.metricLabel}>Not Contacted</span>
+                    </div>
+                    <div style={styles.metricCardMessaged}>
+                      <span style={styles.metricNumber}>{metrics['Messaged']}</span>
+                      <span style={styles.metricLabel}>Messaged</span>
+                    </div>
+                    <div style={styles.metricCardReplied}>
+                      <span style={styles.metricNumber}>{metrics['Replied']}</span>
+                      <span style={styles.metricLabel}>Replied</span>
+                    </div>
+                    <div style={styles.metricCardReceived}>
+                      <span style={styles.metricNumber}>{metrics['Referral received']}</span>
+                      <span style={styles.metricLabel}>Referral Recv</span>
+                    </div>
+                  </div>
+                </div>
+              );
+            })()}
+
+            {/* Tracked Contacts Quick List (if contacts exist) */}
+            {contacts.length > 0 && (
+              <div style={styles.allContactsCard}>
+                <div style={styles.allContactsHeader}>
+                  <span style={styles.allContactsTitle}>Tracked Contacts</span>
+                  <span style={styles.allContactsSub}>Across Pipeline</span>
+                </div>
+                <div style={styles.allContactsList}>
+                  {contacts.slice(0, 6).map((c) => {
+                    const job = savedJobs.find((j) => j.id === c.jobId);
+                    return (
+                      <div key={c.id} style={styles.allContactRow}>
+                        <div style={{ minWidth: 0, flex: 1 }}>
+                          <span style={styles.allContactName}>{c.name}</span>
+                          <span style={styles.allContactJob}>
+                            {c.role ? `${c.role} · ` : ''}
+                            {job?.company || 'Saved Job'}
+                          </span>
+                        </div>
+                        <span
+                          style={{
+                            ...styles.miniStatusBadge,
+                            ...getStatusBadgeStyle(c.status),
+                          }}
+                        >
+                          {c.status}
+                        </span>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
 
             <div style={styles.referralExplainerCard}>
               <div style={styles.explainerHeader}>
@@ -772,16 +1418,16 @@ export default function App() {
               <div style={styles.comparisonGrid}>
                 <div style={styles.compBoxActive}>
                   <span style={styles.compStatus}>✓ Active in v1.0</span>
-                  <h4 style={styles.compTitle}>Job DOM Extraction</h4>
+                  <h4 style={styles.compTitle}>Job DOM Extraction & Contact Tracking</h4>
                   <p style={styles.compText}>
-                    Inspects active LinkedIn job page for title, company, location, salary, and canonical URL.
+                    Inspects LinkedIn postings, saves pipeline jobs, and tracks employee referral contacts with 4-stage outreach states.
                   </p>
                 </div>
                 <div style={styles.compBoxNext}>
                   <span style={styles.compStatusPending}>⌛ Upcoming Phase</span>
-                  <h4 style={styles.compTitle}>Employee Discovery</h4>
+                  <h4 style={styles.compTitle}>Automated Network Graph Discovery</h4>
                   <p style={styles.compText}>
-                    Requires authenticated directory permissions or backend graph syncing to index 1st & 2nd degree team connections.
+                    Requires authenticated directory permissions or backend graph syncing to automatically index 1st & 2nd degree team connections.
                   </p>
                 </div>
               </div>
@@ -905,7 +1551,9 @@ export default function App() {
             <path d="M23 21v-2a4 4 0 0 0-3-3.87" />
             <path d="M16 3.13a4 4 0 0 1 0 7.75" />
           </svg>
-          <span style={styles.navLabel}>Referrals</span>
+          <span style={styles.navLabel}>
+            Referrals{contacts.length > 0 ? ` (${contacts.length})` : ''}
+          </span>
         </button>
 
         <button
@@ -1769,6 +2417,602 @@ const styles = {
     backgroundColor: '#1e293b',
     padding: '2px 8px',
     borderRadius: '4px',
+  },
+  // Pipeline details & referral hub styling
+  detailNavRow: {
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: '2px',
+  },
+  backButton: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: '6px',
+    backgroundColor: '#1e293b',
+    border: '1px solid #334155',
+    color: '#93c5fd',
+    padding: '6px 10px',
+    borderRadius: '6px',
+    fontSize: '11px',
+    fontWeight: '600',
+    cursor: 'pointer',
+  },
+  detailScopeBadge: {
+    fontSize: '10px',
+    fontWeight: '700',
+    color: '#60a5fa',
+    backgroundColor: 'rgba(37, 99, 235, 0.15)',
+    border: '1px solid rgba(59, 130, 246, 0.3)',
+    padding: '2px 8px',
+    borderRadius: '10px',
+    textTransform: 'uppercase',
+    letterSpacing: '0.4px',
+  },
+  detailJobCard: {
+    backgroundColor: '#111827',
+    borderRadius: '10px',
+    border: '1px solid #1e293b',
+    padding: '12px',
+    display: 'flex',
+    flexDirection: 'column',
+    gap: '8px',
+  },
+  detailJobHeaderRow: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: '10px',
+  },
+  companyAvatarSmall: {
+    width: '34px',
+    height: '34px',
+    borderRadius: '6px',
+    backgroundColor: '#1d4ed8',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    fontSize: '15px',
+    fontWeight: '800',
+    color: '#ffffff',
+    flexShrink: 0,
+  },
+  detailJobTitle: {
+    fontSize: '13px',
+    fontWeight: '700',
+    color: '#f8fafc',
+    lineHeight: '1.25',
+    margin: 0,
+  },
+  detailJobCompany: {
+    fontSize: '11px',
+    color: '#60a5fa',
+    fontWeight: '600',
+  },
+  detailActionsRow: {
+    display: 'flex',
+    gap: '8px',
+    marginTop: '4px',
+  },
+  findReferralsMainBtn: {
+    flex: 1,
+    padding: '8px 12px',
+    borderRadius: '6px',
+    backgroundColor: '#0a66c2',
+    color: '#ffffff',
+    fontSize: '11px',
+    fontWeight: '600',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: '6px',
+    cursor: 'pointer',
+    border: 'none',
+    boxShadow: '0 2px 6px rgba(10, 102, 194, 0.3)',
+  },
+  detailViewJobBtn: {
+    padding: '8px 12px',
+    borderRadius: '6px',
+    backgroundColor: '#1e293b',
+    border: '1px solid #334155',
+    color: '#cbd5e1',
+    fontSize: '11px',
+    fontWeight: '600',
+    cursor: 'pointer',
+  },
+  contactsSection: {
+    display: 'flex',
+    flexDirection: 'column',
+    gap: '10px',
+    marginTop: '4px',
+  },
+  contactsSectionHeader: {
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+  contactsTitleGroup: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: '6px',
+  },
+  contactsSectionTitle: {
+    fontSize: '12px',
+    fontWeight: '700',
+    color: '#cbd5e1',
+    textTransform: 'uppercase',
+    letterSpacing: '0.4px',
+    margin: 0,
+  },
+  contactsCountBadge: {
+    fontSize: '10px',
+    fontWeight: '700',
+    backgroundColor: '#1e293b',
+    color: '#60a5fa',
+    padding: '1px 6px',
+    borderRadius: '10px',
+    border: '1px solid #3b82f6',
+  },
+  addContactButton: {
+    padding: '4px 10px',
+    borderRadius: '6px',
+    backgroundColor: '#2563eb',
+    color: '#ffffff',
+    fontSize: '11px',
+    fontWeight: '600',
+    cursor: 'pointer',
+    border: 'none',
+  },
+  contactFormCard: {
+    backgroundColor: '#111827',
+    borderRadius: '10px',
+    border: '1px solid #2563eb',
+    padding: '12px',
+    display: 'flex',
+    flexDirection: 'column',
+    gap: '10px',
+    boxShadow: '0 4px 14px rgba(37, 99, 235, 0.2)',
+  },
+  contactFormHeader: {
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+  contactFormTitle: {
+    fontSize: '12px',
+    fontWeight: '700',
+    color: '#93c5fd',
+  },
+  formCloseBtn: {
+    background: 'none',
+    border: 'none',
+    color: '#94a3b8',
+    fontSize: '14px',
+    cursor: 'pointer',
+    padding: '2px',
+  },
+  formErrorBanner: {
+    backgroundColor: 'rgba(239, 68, 68, 0.15)',
+    border: '1px solid rgba(239, 68, 68, 0.4)',
+    color: '#fca5a5',
+    padding: '6px 10px',
+    borderRadius: '6px',
+    fontSize: '11px',
+    display: 'flex',
+    alignItems: 'center',
+    gap: '6px',
+  },
+  formFields: {
+    display: 'flex',
+    flexDirection: 'column',
+    gap: '8px',
+  },
+  formField: {
+    display: 'flex',
+    flexDirection: 'column',
+    gap: '3px',
+  },
+  formLabel: {
+    fontSize: '10px',
+    fontWeight: '600',
+    color: '#cbd5e1',
+    textTransform: 'uppercase',
+  },
+  requiredStar: {
+    color: '#f87171',
+  },
+  formInput: {
+    width: '100%',
+    padding: '7px 9px',
+    backgroundColor: '#070b13',
+    border: '1px solid #1e293b',
+    borderRadius: '6px',
+    color: '#f8fafc',
+    fontSize: '11px',
+    outline: 'none',
+    fontFamily: 'inherit',
+    boxSizing: 'border-box',
+  },
+  formSelect: {
+    width: '100%',
+    padding: '7px 9px',
+    backgroundColor: '#070b13',
+    border: '1px solid #1e293b',
+    borderRadius: '6px',
+    color: '#f8fafc',
+    fontSize: '11px',
+    outline: 'none',
+    fontFamily: 'inherit',
+    boxSizing: 'border-box',
+    cursor: 'pointer',
+  },
+  formTextarea: {
+    width: '100%',
+    height: '52px',
+    padding: '7px 9px',
+    backgroundColor: '#070b13',
+    border: '1px solid #1e293b',
+    borderRadius: '6px',
+    color: '#f8fafc',
+    fontSize: '11px',
+    outline: 'none',
+    fontFamily: 'inherit',
+    resize: 'none',
+    boxSizing: 'border-box',
+  },
+  formBtnRow: {
+    display: 'flex',
+    gap: '8px',
+    marginTop: '4px',
+  },
+  formSubmitBtn: {
+    flex: 1,
+    padding: '8px',
+    backgroundColor: '#2563eb',
+    color: '#ffffff',
+    fontSize: '11px',
+    fontWeight: '600',
+    borderRadius: '6px',
+    cursor: 'pointer',
+    border: 'none',
+  },
+  formCancelBtn: {
+    padding: '8px 12px',
+    backgroundColor: '#1e293b',
+    border: '1px solid #334155',
+    color: '#94a3b8',
+    fontSize: '11px',
+    fontWeight: '600',
+    borderRadius: '6px',
+    cursor: 'pointer',
+  },
+  emptyContactsCard: {
+    backgroundColor: '#111827',
+    borderRadius: '8px',
+    border: '1px solid #1e293b',
+    padding: '20px 14px',
+    textAlign: 'center',
+    display: 'flex',
+    flexDirection: 'column',
+    alignItems: 'center',
+    gap: '6px',
+  },
+  emptyContactsTitle: {
+    fontSize: '13px',
+    fontWeight: '700',
+    color: '#f8fafc',
+    margin: 0,
+  },
+  emptyContactsDesc: {
+    fontSize: '11px',
+    color: '#94a3b8',
+    lineHeight: '1.4',
+    margin: 0,
+  },
+  emptyAddContactBtn: {
+    marginTop: '6px',
+    padding: '6px 12px',
+    backgroundColor: '#1e293b',
+    border: '1px solid #3b82f6',
+    color: '#93c5fd',
+    borderRadius: '6px',
+    fontSize: '11px',
+    fontWeight: '600',
+    cursor: 'pointer',
+  },
+  contactsList: {
+    display: 'flex',
+    flexDirection: 'column',
+    gap: '8px',
+  },
+  contactItemCard: {
+    backgroundColor: '#111827',
+    borderRadius: '8px',
+    border: '1px solid #1e293b',
+    padding: '10px 12px',
+    display: 'flex',
+    flexDirection: 'column',
+    gap: '6px',
+  },
+  contactCardHeaderRow: {
+    display: 'flex',
+    alignItems: 'flex-start',
+    justifyContent: 'space-between',
+    gap: '8px',
+  },
+  contactCardIdentity: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: '8px',
+    flex: 1,
+    minWidth: 0,
+  },
+  contactAvatar: {
+    width: '28px',
+    height: '28px',
+    borderRadius: '50%',
+    backgroundColor: '#1e293b',
+    border: '1px solid #334155',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    fontSize: '12px',
+    fontWeight: '700',
+    color: '#60a5fa',
+    flexShrink: 0,
+  },
+  contactCardName: {
+    fontSize: '12px',
+    fontWeight: '700',
+    color: '#ffffff',
+    margin: 0,
+    lineHeight: '1.2',
+  },
+  contactCardRole: {
+    fontSize: '10px',
+    color: '#cbd5e1',
+  },
+  contactCardRoleMuted: {
+    fontSize: '10px',
+    color: '#64748b',
+    fontStyle: 'italic',
+  },
+  statusDropdown: {
+    padding: '3px 8px',
+    borderRadius: '6px',
+    fontSize: '10px',
+    fontWeight: '600',
+    borderWidth: '1px',
+    borderStyle: 'solid',
+    outline: 'none',
+    cursor: 'pointer',
+    fontFamily: 'inherit',
+  },
+  contactUrlRow: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: '6px',
+    backgroundColor: '#0a0f1d',
+    padding: '4px 8px',
+    borderRadius: '4px',
+    border: '1px solid #1e293b',
+  },
+  contactUrlLink: {
+    fontSize: '10px',
+    color: '#60a5fa',
+    textDecoration: 'none',
+    overflow: 'hidden',
+    textOverflow: 'ellipsis',
+    whiteSpace: 'nowrap',
+    flex: 1,
+  },
+  contactNotesBox: {
+    backgroundColor: '#070b13',
+    borderRadius: '4px',
+    border: '1px solid #1e293b',
+    padding: '6px 8px',
+    fontSize: '10px',
+    color: '#cbd5e1',
+    lineHeight: '1.35',
+  },
+  notesLabel: {
+    fontWeight: '700',
+    color: '#94a3b8',
+  },
+  contactCardActions: {
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'flex-end',
+    gap: '6px',
+    marginTop: '2px',
+  },
+  contactEditBtn: {
+    padding: '3px 8px',
+    backgroundColor: '#1e293b',
+    border: '1px solid #334155',
+    color: '#cbd5e1',
+    fontSize: '10px',
+    fontWeight: '600',
+    borderRadius: '4px',
+    cursor: 'pointer',
+  },
+  contactDeleteBtn: {
+    padding: '3px 8px',
+    backgroundColor: 'rgba(239, 68, 68, 0.15)',
+    border: '1px solid rgba(239, 68, 68, 0.3)',
+    color: '#f87171',
+    fontSize: '10px',
+    fontWeight: '700',
+    borderRadius: '4px',
+    cursor: 'pointer',
+  },
+  pipelineItemClickableHeader: {
+    display: 'flex',
+    justifyContent: 'space-between',
+    alignItems: 'flex-start',
+    cursor: 'pointer',
+  },
+  pipelineContactsPill: {
+    fontSize: '9px',
+    color: '#93c5fd',
+    backgroundColor: 'rgba(37, 99, 235, 0.15)',
+    border: '1px solid rgba(59, 130, 246, 0.3)',
+    padding: '2px 6px',
+    borderRadius: '4px',
+    fontWeight: '600',
+  },
+  pipelineManageContactsBtn: {
+    flex: 1,
+    padding: '5px 8px',
+    borderRadius: '4px',
+    backgroundColor: '#1e3a8a',
+    border: '1px solid #2563eb',
+    color: '#eff6ff',
+    fontSize: '10px',
+    fontWeight: '600',
+    cursor: 'pointer',
+  },
+  metricsContainer: {
+    backgroundColor: '#111827',
+    borderRadius: '10px',
+    border: '1px solid #1e293b',
+    padding: '12px',
+    display: 'flex',
+    flexDirection: 'column',
+    gap: '10px',
+  },
+  metricsHeader: {
+    display: 'flex',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+  },
+  metricsTitle: {
+    fontSize: '12px',
+    fontWeight: '700',
+    color: '#f8fafc',
+  },
+  totalContactsBadge: {
+    fontSize: '10px',
+    fontWeight: '700',
+    color: '#60a5fa',
+    backgroundColor: '#1e293b',
+    padding: '2px 8px',
+    borderRadius: '10px',
+    border: '1px solid #3b82f6',
+  },
+  metricsGrid: {
+    display: 'grid',
+    gridTemplateColumns: 'repeat(4, 1fr)',
+    gap: '6px',
+  },
+  metricCardNotContacted: {
+    backgroundColor: '#0a0f1d',
+    border: '1px solid #334155',
+    borderRadius: '6px',
+    padding: '8px 4px',
+    textAlign: 'center',
+    display: 'flex',
+    flexDirection: 'column',
+    gap: '2px',
+  },
+  metricCardMessaged: {
+    backgroundColor: '#0a0f1d',
+    border: '1px solid rgba(59, 130, 246, 0.4)',
+    borderRadius: '6px',
+    padding: '8px 4px',
+    textAlign: 'center',
+    display: 'flex',
+    flexDirection: 'column',
+    gap: '2px',
+  },
+  metricCardReplied: {
+    backgroundColor: '#0a0f1d',
+    border: '1px solid rgba(168, 85, 247, 0.4)',
+    borderRadius: '6px',
+    padding: '8px 4px',
+    textAlign: 'center',
+    display: 'flex',
+    flexDirection: 'column',
+    gap: '2px',
+  },
+  metricCardReceived: {
+    backgroundColor: '#0a0f1d',
+    border: '1px solid rgba(16, 185, 129, 0.4)',
+    borderRadius: '6px',
+    padding: '8px 4px',
+    textAlign: 'center',
+    display: 'flex',
+    flexDirection: 'column',
+    gap: '2px',
+  },
+  metricNumber: {
+    fontSize: '14px',
+    fontWeight: '800',
+    color: '#ffffff',
+  },
+  metricLabel: {
+    fontSize: '8px',
+    fontWeight: '600',
+    color: '#94a3b8',
+    textTransform: 'uppercase',
+    letterSpacing: '0.2px',
+  },
+  allContactsCard: {
+    backgroundColor: '#111827',
+    borderRadius: '10px',
+    border: '1px solid #1e293b',
+    padding: '12px',
+    display: 'flex',
+    flexDirection: 'column',
+    gap: '8px',
+  },
+  allContactsHeader: {
+    display: 'flex',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+  },
+  allContactsTitle: {
+    fontSize: '12px',
+    fontWeight: '700',
+    color: '#f8fafc',
+  },
+  allContactsSub: {
+    fontSize: '10px',
+    color: '#64748b',
+  },
+  allContactsList: {
+    display: 'flex',
+    flexDirection: 'column',
+    gap: '6px',
+  },
+  allContactRow: {
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    backgroundColor: '#0a0f1d',
+    padding: '6px 8px',
+    borderRadius: '6px',
+    border: '1px solid #1e293b',
+    gap: '8px',
+  },
+  allContactName: {
+    fontSize: '11px',
+    fontWeight: '600',
+    color: '#f1f5f9',
+    display: 'block',
+  },
+  allContactJob: {
+    fontSize: '10px',
+    color: '#60a5fa',
+    display: 'block',
+  },
+  miniStatusBadge: {
+    fontSize: '9px',
+    fontWeight: '700',
+    padding: '2px 6px',
+    borderRadius: '4px',
+    borderWidth: '1px',
+    borderStyle: 'solid',
+    flexShrink: 0,
   },
   bottomNav: {
     position: 'absolute',

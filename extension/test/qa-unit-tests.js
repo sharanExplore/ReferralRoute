@@ -185,6 +185,11 @@ import {
   validateProfileUrl,
   validateContactInput,
   createContactRecord,
+  updateContactRecord,
+  filterContactsByJob,
+  removeContactById,
+  removeContactsForJob,
+  calculateStatusMetrics,
 } from '../src/contact-utils.js';
 
 // Subtest 5.1: URL normalization and validation
@@ -343,5 +348,149 @@ import {
   console.log('✓ Test 5.5: Contact CRUD and cascading job deletion passed.');
 }
 
+// Subtest 5.6: Status updates & updateContactRecord validation
+{
+  const initialContact = createContactRecord({
+    jobId: 'job-101',
+    name: 'Dwight Schrute',
+    role: 'Assistant to the Regional Manager',
+    profileUrl: 'https://www.linkedin.com/in/dwight-schrute',
+    status: 'Not contacted',
+    notes: 'Needs beets.',
+  });
+
+  assert.strictEqual(initialContact.status, 'Not contacted');
+
+  // Transition through each valid status
+  const messaged = updateContactRecord(initialContact, { status: 'Messaged' });
+  assert.strictEqual(messaged.status, 'Messaged', 'Status should update to Messaged');
+  assert.strictEqual(messaged.id, initialContact.id, 'ID must be preserved');
+  assert.strictEqual(messaged.createdAt, initialContact.createdAt, 'createdAt must be preserved');
+
+  const replied = updateContactRecord(messaged, { status: 'Replied', notes: 'Agreed to coffee chat.' });
+  assert.strictEqual(replied.status, 'Replied', 'Status should update to Replied');
+  assert.strictEqual(replied.notes, 'Agreed to coffee chat.', 'Notes should update');
+
+  const referralReceived = updateContactRecord(replied, { status: 'Referral received' });
+  assert.strictEqual(referralReceived.status, 'Referral received', 'Status should update to Referral received');
+
+  // Attempt invalid status should fallback/retain current status
+  const invalidStatus = updateContactRecord(referralReceived, { status: 'Pending Review' });
+  assert.strictEqual(invalidStatus.status, 'Referral received', 'Invalid status should retain current valid status');
+
+  console.log('✓ Test 5.6: Status transitions across all 4 statuses and invalid fallback passed.');
+}
+
+// Subtest 5.7: Job association and helper functions
+{
+  const contactsList = [
+    createContactRecord({ jobId: 'job-alpha', name: 'Stanley Hudson', status: 'Not contacted' }),
+    createContactRecord({ jobId: 'job-alpha', name: 'Phyllis Vance', status: 'Messaged' }),
+    createContactRecord({ jobId: 'job-beta', name: 'Andy Bernard', status: 'Replied' }),
+    createContactRecord({ jobId: 'job-gamma', name: 'Oscar Martinez', status: 'Referral received' }),
+  ];
+
+  // Test filterContactsByJob
+  const alphaContacts = filterContactsByJob(contactsList, 'job-alpha');
+  assert.strictEqual(alphaContacts.length, 2, 'job-alpha should have exactly 2 associated contacts');
+  assert.ok(alphaContacts.every((c) => c.jobId === 'job-alpha'), 'All filtered contacts must belong to job-alpha');
+
+  const betaContacts = filterContactsByJob(contactsList, 'job-beta');
+  assert.strictEqual(betaContacts.length, 1, 'job-beta should have 1 contact');
+
+  const nonExistent = filterContactsByJob(contactsList, 'job-missing');
+  assert.strictEqual(nonExistent.length, 0, 'Missing job ID should return empty array');
+
+  const nullJob = filterContactsByJob(contactsList, null);
+  assert.strictEqual(nullJob.length, 0, 'Null job ID should return empty array');
+
+  // Test removeContactById
+  const contactToRemove = alphaContacts[0];
+  const listAfterRemoval = removeContactById(contactsList, contactToRemove.id);
+  assert.strictEqual(listAfterRemoval.length, 3, 'After removing 1 contact, length should be 3');
+  assert.strictEqual(listAfterRemoval.some((c) => c.id === contactToRemove.id), false, 'Removed contact should not exist');
+
+  // Test removeContactsForJob (cascading removal)
+  const listAfterJobCascade = removeContactsForJob(contactsList, 'job-alpha');
+  assert.strictEqual(listAfterJobCascade.length, 2, 'Removing job-alpha should leave 2 contacts (beta and gamma)');
+  assert.strictEqual(listAfterJobCascade.some((c) => c.jobId === 'job-alpha'), false, 'No contacts for job-alpha should remain');
+
+  console.log('✓ Test 5.7: Job association filtering and cascading removal helpers passed.');
+}
+
+// Subtest 5.8: Status metrics computation
+{
+  const contacts = [
+    createContactRecord({ jobId: 'job-1', name: 'User 1', status: 'Not contacted' }),
+    createContactRecord({ jobId: 'job-1', name: 'User 2', status: 'Messaged' }),
+    createContactRecord({ jobId: 'job-1', name: 'User 3', status: 'Messaged' }),
+    createContactRecord({ jobId: 'job-2', name: 'User 4', status: 'Replied' }),
+    createContactRecord({ jobId: 'job-2', name: 'User 5', status: 'Referral received' }),
+    createContactRecord({ jobId: 'job-2', name: 'User 6', status: 'Referral received' }),
+  ];
+
+  const metrics = calculateStatusMetrics(contacts);
+  assert.strictEqual(metrics.total, 6);
+  assert.strictEqual(metrics['Not contacted'], 1);
+  assert.strictEqual(metrics['Messaged'], 2);
+  assert.strictEqual(metrics['Replied'], 1);
+  assert.strictEqual(metrics['Referral received'], 2);
+
+  const emptyMetrics = calculateStatusMetrics([]);
+  assert.strictEqual(emptyMetrics.total, 0);
+  assert.strictEqual(emptyMetrics['Not contacted'], 0);
+  console.log('✓ Test 5.8: Status metrics computation passed.');
+}
+
+// Subtest 5.9: Additional duplicate detection & validation edge cases
+{
+  const contacts = [
+    createContactRecord({
+      jobId: 'job-999',
+      name: 'Angela Martin',
+      profileUrl: 'https://linkedin.com/in/angela-martin',
+    }),
+  ];
+
+  // Name with extra leading/trailing whitespace
+  const paddedNameDup = validateContactInput({
+    jobId: 'job-999',
+    name: '   Angela Martin   ',
+    profileUrl: '',
+    existingContacts: contacts,
+  });
+  assert.strictEqual(paddedNameDup.valid, false, 'Padded duplicate name must be rejected');
+
+  // URL without protocol matching URL with protocol
+  const protocolUrlDup = validateContactInput({
+    jobId: 'job-999',
+    name: 'Different Name',
+    profileUrl: 'linkedin.com/in/angela-martin',
+    existingContacts: contacts,
+  });
+  assert.strictEqual(protocolUrlDup.valid, false, 'Same normalized LinkedIn URL must be rejected');
+
+  // Case insensitive URL matching
+  const caseUrlDup = validateContactInput({
+    jobId: 'job-999',
+    name: 'Different Name 2',
+    profileUrl: 'https://LINKEDIN.COM/in/angela-martin',
+    existingContacts: contacts,
+  });
+  assert.strictEqual(caseUrlDup.valid, false, 'Uppercase hostname URL must be rejected as duplicate');
+
+  // Non-duplicate in same job with distinct name and URL
+  const uniqueContact = validateContactInput({
+    jobId: 'job-999',
+    name: 'Kevin Malone',
+    profileUrl: 'https://linkedin.com/in/kevin-malone',
+    existingContacts: contacts,
+  });
+  assert.strictEqual(uniqueContact.valid, true, 'Unique contact in same job should be valid');
+
+  console.log('✓ Test 5.9: Extended duplicate detection edge cases passed.');
+}
+
 console.log('--- All ReferralRoute QA Unit Tests Passed Successfully ---');
+
 
